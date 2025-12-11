@@ -1,9 +1,5 @@
 import requests
 
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
 API_BASE = "https://api.tiendanube.com/v1"
 
 # --- Chesmin (ORIGEN) ---
@@ -18,7 +14,7 @@ USER_AGENT = "Clonador Chesmin a Jacula (jaculashoppingflores@gmail.com)"
 
 EXCLUDED_CATEGORY_NAME = "Capsula Jacula ✿"
 
-# Ejemplo: 1.28 = Jacula cobra ~28% más que Chesmin
+# Ej: 1.28 = Jacula +28% vs Chesmin
 PRICE_FACTOR = 1.28
 
 
@@ -33,14 +29,10 @@ def make_headers(access_token: str) -> dict:
 CHESMIN_HEADERS = make_headers(CHESMIN_ACCESS_TOKEN)
 JACULA_HEADERS = make_headers(JACULA_ACCESS_TOKEN)
 
-# ============================================
-# HELPERS
-# ============================================
 
 def get_all_products(store_id, headers):
     products = []
     page = 1
-
     while True:
         resp = requests.get(
             f"{API_BASE}/{store_id}/products",
@@ -62,26 +54,9 @@ def get_all_products(store_id, headers):
     return products
 
 
-def product_has_excluded_category(product: dict) -> bool:
-    for cat in product.get("categories", []):
-        for name in (cat.get("name", {}) or {}).values():
-            if name == EXCLUDED_CATEGORY_NAME:
-                return True
-    return False
-
-
-def build_product_key(product: dict) -> str | None:
-    # prioriza SKU de la primer variante con sku
-    for v in product.get("variants", []):
-        sku = v.get("sku")
-        if sku:
-            return sku
-
-    name = product.get("name") or {}
-    return name.get("es") or next(iter(name.values()), None)
-
-
 def is_visible(product: dict) -> bool:
+    # Tiendanube suele traer published True/False.
+    # Dejamos fallback por si cambia.
     if product.get("published") is True:
         return True
     if product.get("status") == "published":
@@ -89,44 +64,57 @@ def is_visible(product: dict) -> bool:
     return False
 
 
+def product_has_excluded_category(product: dict) -> bool:
+    for cat in product.get("categories", []):
+        name_dict = cat.get("name", {}) or {}
+        for lang_name in name_dict.values():
+            if lang_name == EXCLUDED_CATEGORY_NAME:
+                return True
+    return False
+
+
+def build_product_key(product: dict) -> str | None:
+    for variant in product.get("variants", []):
+        sku = variant.get("sku")
+        if sku:
+            return sku
+
+    name = product.get("name") or {}
+    return name.get("es") or next(iter(name.values()), None)
+
+
 def dedupe_variant_values(values):
     """
-    FIX del 422:
-    Tiendanube no permite values repetidos dentro de una variante.
-    Deduplicamos preservando orden.
+    FIX 422: "Variant values should not be repeated"
+    Deduplicamos los values dentro de la misma variante.
     """
     if not isinstance(values, list):
         return values
 
     seen = set()
     out = []
-
     for v in values:
         if not isinstance(v, dict):
-            key = ("raw", str(v))
+            k = ("raw", str(v))
         else:
-            # intentamos claves típicas
             if "option_id" in v:
-                key = ("option_id", v.get("option_id"))
+                k = ("option_id", v.get("option_id"))
             elif "id" in v:
-                key = ("id", v.get("id"))
+                k = ("id", v.get("id"))
             elif "name" in v:
-                key = ("name", str(v.get("name")))
+                k = ("name", str(v.get("name")))
             elif "value" in v:
-                key = ("value", str(v.get("value")))
+                k = ("value", str(v.get("value")))
             else:
-                # fallback: contenido
-                key = ("dict", tuple(sorted(v.items())))
+                k = ("dict", tuple(sorted(v.items())))
 
-        if key in seen:
+        if k in seen:
             continue
-        seen.add(key)
+        seen.add(k)
         out.append(v)
 
     return out
 
-
-# ---------- Precios ----------
 
 def adjust_prices_from_variant(src_variant: dict):
     price = float(src_variant["price"])
@@ -144,14 +132,13 @@ def adjust_prices_from_variant(src_variant: dict):
     return new_price, new_promo
 
 
-def build_jacula_payload_from_chesmin(src_product: dict) -> dict:
+def build_jacula_payload_from_chesmin(src_product: dict, force_published: bool | None = None) -> dict:
     variants_out = []
     for v in src_product.get("variants", []):
         new_price, new_promo = adjust_prices_from_variant(v)
-
         values = dedupe_variant_values(v.get("values", []))
 
-        out = {
+        variant_out = {
             "name": v.get("name"),
             "sku": v.get("sku"),
             "price": new_price,
@@ -160,11 +147,15 @@ def build_jacula_payload_from_chesmin(src_product: dict) -> dict:
             "values": values,
         }
         if new_promo is not None:
-            out["promotional_price"] = new_promo
+            variant_out["promotional_price"] = new_promo
 
-        variants_out.append(out)
+        variants_out.append(variant_out)
 
-    images_out = [{"src": img.get("src")} for img in src_product.get("images", []) if img.get("src")]
+    images_out = []
+    for img in src_product.get("images", []):
+        src = img.get("src")
+        if src:
+            images_out.append({"src": src})
 
     payload = {
         "name": src_product.get("name"),
@@ -173,57 +164,61 @@ def build_jacula_payload_from_chesmin(src_product: dict) -> dict:
         "tags": src_product.get("tags"),
         "variants": variants_out,
         "images": images_out,
-        "published": True,  # solo clonamos visibles
     }
+
+    if force_published is None:
+        payload["published"] = src_product.get("published")
+    else:
+        payload["published"] = force_published
 
     return payload
 
 
-# ============================================
-# SYNC
-# ============================================
-
 def sync_chesmin_to_jacula():
     print("Descargando productos de Chesmin...")
-    all_chesmin = get_all_products(CHESMIN_STORE_ID, CHESMIN_HEADERS)
-    print(f"  → {len(all_chesmin)} productos totales en Chesmin")
-
-    chesmin_visible = [p for p in all_chesmin if is_visible(p)]
-    print(f"  → {len(chesmin_visible)} productos visibles en Chesmin (a clonar)")
+    chesmin_products = get_all_products(CHESMIN_STORE_ID, CHESMIN_HEADERS)
+    print(f"  → {len(chesmin_products)} productos totales en Chesmin")
 
     print("Descargando productos de Jacula...")
     jacula_products = get_all_products(JACULA_STORE_ID, JACULA_HEADERS)
     print(f"  → {len(jacula_products)} productos totales en Jacula")
 
-    jacula_by_key = {}
+    jacula_by_key: dict[str, dict] = {}
     for p in jacula_products:
-        if product_has_excluded_category(p):
-            continue
         key = build_product_key(p)
         if key:
             jacula_by_key[key] = p
 
-    visible_keys = set()
+    # 1) VISIBLES: crear/actualizar
+    visibles = [p for p in chesmin_products if is_visible(p)]
+    print(f"  → {len(visibles)} productos visibles en Chesmin (se clonan)")
 
-    # Crear / actualizar visibles
-    for src in chesmin_visible:
+    for src in visibles:
         key = build_product_key(src)
         if not key:
-            print("[SKIP] Producto Chesmin sin key (sin SKU y sin nombre)")
+            print("[SKIP] Chesmin sin key (sin sku y sin nombre)")
             continue
 
-        visible_keys.add(key)
         dst = jacula_by_key.get(key)
 
-        payload = build_jacula_payload_from_chesmin(src)
+        # Clonamos visibles como visibles sí o sí
+        payload = build_jacula_payload_from_chesmin(src, force_published=True)
 
         if dst:
-            print(f"[UPDATE] {key}")
+            if product_has_excluded_category(dst):
+                print(f"[SKIP] Está en '{EXCLUDED_CATEGORY_NAME}', no se toca. key={key}")
+                continue
+
+            product_id = dst["id"]
+            print(f"[UPDATE] {key} -> Jacula id={product_id}")
             resp = requests.put(
-                f"{API_BASE}/{JACULA_STORE_ID}/products/{dst['id']}",
+                f"{API_BASE}/{JACULA_STORE_ID}/products/{product_id}",
                 headers=JACULA_HEADERS,
                 json=payload,
             )
+            if resp.status_code >= 400:
+                print(f"  → ERROR {resp.status_code}: {resp.text[:300]}")
+
         else:
             print(f"[CREATE] {key}")
             resp = requests.post(
@@ -231,31 +226,36 @@ def sync_chesmin_to_jacula():
                 headers=JACULA_HEADERS,
                 json=payload,
             )
+            if resp.status_code >= 400:
+                print(f"  → ERROR {resp.status_code}: {resp.text[:300]}")
 
-        if resp.status_code >= 400:
-            print(f"  → ERROR {resp.status_code}: {resp.text[:300]}")
+    # 2) OCULTOS: NO crear, solo ocultar si ya existe en Jacula
+    ocultos = [p for p in chesmin_products if not is_visible(p)]
+    print(f"  → {len(ocultos)} productos ocultos en Chesmin (NO se crean; solo se ocultan si existen)")
 
-    # Ocultar en Jacula lo que dejó de estar visible en Chesmin
-    for p in jacula_products:
-        if product_has_excluded_category(p):
-            continue
-
-        key = build_product_key(p)
+    for src in ocultos:
+        key = build_product_key(src)
         if not key:
             continue
 
-        if key in visible_keys:
+        dst = jacula_by_key.get(key)
+        if not dst:
+            # Importante: NO lo creamos
             continue
 
-        if is_visible(p):
-            print(f"[HIDE] Ocultando {key}")
+        if product_has_excluded_category(dst):
+            continue
+
+        # Solo ocultamos (no tocamos variantes/imagenes en ocultos)
+        if is_visible(dst):
+            print(f"[HIDE] {key} -> ocultando en Jacula id={dst['id']}")
             resp = requests.put(
-                f"{API_BASE}/{JACULA_STORE_ID}/products/{p['id']}",
+                f"{API_BASE}/{JACULA_STORE_ID}/products/{dst['id']}",
                 headers=JACULA_HEADERS,
                 json={"published": False},
             )
             if resp.status_code >= 400:
-                print(f"  → ERROR ocultando {resp.status_code}: {resp.text[:300]}")
+                print(f"  → ERROR {resp.status_code}: {resp.text[:300]}")
 
     print("Sincronización terminada.")
 
