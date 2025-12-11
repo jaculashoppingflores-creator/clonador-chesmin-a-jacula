@@ -44,8 +44,12 @@ JACULA_HEADERS = make_headers(JACULA_ACCESS_TOKEN)
 # ============================================
 
 
-def get_all_products(store_id: int, headers: dict):
-    """Descarga TODOS los productos de una tienda, paginando."""
+def get_all_products(store_id, headers):
+    """Obtiene todos los productos de una tienda, paginando.
+
+    Tiendanube a veces responde 404 cuando pedís una página que no existe.
+    En ese caso tomamos que ya no hay más productos y cortamos el bucle.
+    """
     products = []
     page = 1
 
@@ -53,16 +57,25 @@ def get_all_products(store_id: int, headers: dict):
         resp = requests.get(
             f"{API_BASE}/{store_id}/products",
             headers=headers,
-            params={"per_page": 200, "page": page},
+            params={"page": page, "per_page": 200},
         )
-        resp.raise_for_status()
-        chunk = resp.json()
-        if not chunk:
+
+        # Si la página no existe, asumimos que se terminaron los productos
+        if resp.status_code == 404:
             break
-        products.extend(chunk)
+
+        # Para cualquier otro error (401, 500, etc.) sí fallamos
+        resp.raise_for_status()
+
+        data = resp.json()
+        if not data:
+            break
+
+        products.extend(data)
         page += 1
 
     return products
+
 
 
 def product_has_excluded_category(product: dict) -> bool:
