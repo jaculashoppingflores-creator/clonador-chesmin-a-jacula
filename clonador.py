@@ -10,12 +10,12 @@ API_BASE = "https://api.tiendanube.com/v1"
 # Si ves que clona al revés, simplemente intercambiá estos pares.
 
 # --- Chesmin (ORIGEN) ---
-CHESMIN_STORE_ID = 6889084
-CHESMIN_ACCESS_TOKEN = "3c9c872098bb3a1469834dd8a7216880216f4cc1"
+CHESMIN_STORE_ID = 1610487
+CHESMIN_ACCESS_TOKEN = "0e6586bece80829a7050a3ecf5b6e084a8ee0a58"
 
 # --- Jacula (DESTINO) ---
-JACULA_STORE_ID = 1610487
-JACULA_ACCESS_TOKEN = "0e6586bece80829a7050a3ecf5b6e084a8ee0a58"
+JACULA_STORE_ID = 6889084
+JACULA_ACCESS_TOKEN = "3c9c872098bb3a1469834dd8a7216880216f4cc1"
 
 # User-Agent requerido por Tiendanube (podés dejarlo así)
 USER_AGENT = "Clonador Chesmin a Jacula (jaculashoppingflores@gmail.com)"
