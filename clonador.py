@@ -3,16 +3,17 @@ import time
 import requests
 
 API_BASE = "https://api.tiendanube.com/v1"
+USER_AGENT = "Clonador Chesmin a Jacula (jaculashoppingflores@gmail.com)"
 
-USER_AGENT = os.getenv("USER_AGENT", "Clonador Chesmin a Jacula (jaculashoppingflores@gmail.com)")
-EXCLUDED_CATEGORY_NAME = os.getenv("EXCLUDED_CATEGORY_NAME", "Capsula Jacula ✿")
-PRICE_FACTOR = float(os.getenv("PRICE_FACTOR", "1.28"))
+# No tocar productos dentro de esta categoría en Jacula
+EXCLUDED_CATEGORY_NAME = "Capsula Jacula ✿"
 
-CHESMIN_STORE_ID = int(os.getenv("CHESMIN_STORE_ID"))
-CHESMIN_ACCESS_TOKEN = os.getenv("CHESMIN_ACCESS_TOKEN")
-
-JACULA_STORE_ID = int(os.getenv("JACULA_STORE_ID"))
-JACULA_ACCESS_TOKEN = os.getenv("JACULA_ACCESS_TOKEN")
+# Lee secrets desde el workflow env:
+CHESMIN_STORE_ID = int(os.environ["CHESMIN_STORE_ID"])
+JACULA_STORE_ID = int(os.environ["JACULA_STORE_ID"])
+CHESMIN_ACCESS_TOKEN = os.environ["CHESMIN_ACCESS_TOKEN"]
+JACULA_ACCESS_TOKEN = os.environ["JACULA_ACCESS_TOKEN"]
+PRICE_FACTOR = float(os.environ.get("PRICE_FACTOR", "1.0"))
 
 MAX_RETRIES = 8
 
@@ -30,10 +31,8 @@ JACULA_HEADERS = make_headers(JACULA_ACCESS_TOKEN)
 
 
 def request_with_retry(method, url, headers=None, params=None, json=None):
-    last = None
     for attempt in range(1, MAX_RETRIES + 1):
         resp = requests.request(method, url, headers=headers, params=params, json=json)
-        last = resp
 
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
@@ -43,12 +42,14 @@ def request_with_retry(method, url, headers=None, params=None, json=None):
             continue
 
         return resp
-    return last
+
+    return resp
 
 
-def get_all_products(store_id, headers):
+def get_all_products(store_id: int, headers: dict):
     products = []
     page = 1
+
     while True:
         resp = request_with_retry(
             "GET",
@@ -56,20 +57,25 @@ def get_all_products(store_id, headers):
             headers=headers,
             params={"page": page, "per_page": 200},
         )
+
+        # Tiendanube a veces devuelve 404 cuando te pasás de página
         if resp.status_code == 404:
             break
+
         resp.raise_for_status()
         data = resp.json()
         if not data:
             break
+
         products.extend(data)
         page += 1
+
     return products
 
 
 def product_has_excluded_category(product: dict) -> bool:
-    for cat in product.get("categories", []) or []:
-        name_dict = (cat.get("name") or {})
+    for cat in product.get("categories", []):
+        name_dict = cat.get("name", {}) or {}
         for lang_name in name_dict.values():
             if lang_name == EXCLUDED_CATEGORY_NAME:
                 return True
@@ -77,81 +83,69 @@ def product_has_excluded_category(product: dict) -> bool:
 
 
 def build_product_key(product: dict) -> str | None:
-    for v in product.get("variants", []) or []:
+    # Prioridad: SKU de la primera variante con sku
+    for v in product.get("variants", []):
         sku = v.get("sku")
         if sku:
             return sku
+
+    # Fallback: nombre
     name = product.get("name") or {}
     return name.get("es") or next(iter(name.values()), None)
 
 
-def normalize_categories_ids(src_product: dict) -> list[int]:
+def extract_category_ids(src_product: dict):
+    ids = []
+    for c in src_product.get("categories", []):
+        if isinstance(c, dict) and "id" in c:
+            ids.append(int(c["id"]))
+        elif isinstance(c, int):
+            ids.append(c)
+    return ids
+
+
+def normalize_variant_values(v: dict):
+    """
+    Tiendanube espera values como lista de IDs (enteros) y sin repetidos.
+    """
+    values = v.get("values") or []
+    ids = []
+    for it in values:
+        if isinstance(it, dict) and "id" in it:
+            ids.append(int(it["id"]))
+        elif isinstance(it, int):
+            ids.append(it)
+
+    # dedupe manteniendo orden
+    seen = set()
     out = []
-    for c in src_product.get("categories", []) or []:
-        if isinstance(c, dict) and isinstance(c.get("id"), int):
-            out.append(c["id"])
+    for x in ids:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
     return out
 
 
-def get_attribute_names(src_product: dict) -> list[str]:
-    """
-    Lee nombres de atributos (Color / Talle / etc) para poder desambiguar duplicados.
-    """
-    attrs = src_product.get("attributes") or []
-    names = []
-    for a in attrs:
-        nd = a.get("name") or {}
-        names.append(nd.get("es") or next(iter(nd.values()), "Atributo"))
-    return names
-
-
-def adjust_prices(price, promo):
-    price = float(price)
+def adjust_prices(price: float, promo: float | None):
     new_price = round(price * PRICE_FACTOR)
     if promo is None:
         return new_price, None
-    promo = float(promo)
-    discount_factor = promo / price
+
+    # Mantener mismo % promo que Chesmin
+    discount_factor = promo / price if price else 1
     new_promo = round(new_price * discount_factor)
     return new_price, new_promo
 
 
-def fix_variant_values(values, attr_names):
-    """
-    - Asegura que len(values) == len(attributes)
-    - Si hay repetidos dentro de la misma variante, los renombra tipo "Talle: Único"
-      para evitar 422 "values should not be repeated".
-    """
-    values = list(values or [])
-    n = len(attr_names)
-
-    # ajustar largo
-    if n > 0:
-        if len(values) < n:
-            values += ["Único"] * (n - len(values))
-        elif len(values) > n:
-            values = values[:n]
-
-    seen = set()
-    fixed = []
-    for i, val in enumerate(values):
-        val_str = str(val) if val is not None else "Único"
-        if val_str in seen:
-            prefix = attr_names[i] if i < len(attr_names) else "Atributo"
-            val_str = f"{prefix}: {val_str}"
-        seen.add(val_str)
-        fixed.append(val_str)
-
-    return fixed
-
-
-def build_payload(src_product: dict) -> dict:
-    attr_names = get_attribute_names(src_product)
+def build_jacula_payload_from_chesmin(src_product: dict) -> dict:
+    # Variantes
     variants_out = []
+    for v in src_product.get("variants", []):
+        price = float(v["price"])
+        promo = v.get("promotional_price")
+        promo = float(promo) if promo not in (None, "", 0) else None
 
-    for v in src_product.get("variants", []) or []:
-        new_price, new_promo = adjust_prices(v.get("price"), v.get("promotional_price"))
-        values_fixed = fix_variant_values(v.get("values"), attr_names)
+        new_price, new_promo = adjust_prices(price, promo)
 
         variant_out = {
             "name": v.get("name"),
@@ -159,57 +153,55 @@ def build_payload(src_product: dict) -> dict:
             "price": new_price,
             "stock": v.get("stock"),
             "weight": v.get("weight"),
-            "values": values_fixed,
+            "values": normalize_variant_values(v),  # ✅ ARREGLADO
         }
         if new_promo is not None:
             variant_out["promotional_price"] = new_promo
 
         variants_out.append(variant_out)
 
+    # Imágenes
     images_out = []
-    for img in src_product.get("images", []) or []:
-        if img.get("src"):
-            images_out.append({"src": img["src"]})
+    for img in src_product.get("images", []):
+        src = img.get("src")
+        if src:
+            images_out.append({"src": src})
 
     payload = {
         "name": src_product.get("name"),
         "description": src_product.get("description"),
+        "published": bool(src_product.get("published")),
+        "categories": extract_category_ids(src_product),  # ✅ ARREGLADO (lista de ints)
         "tags": src_product.get("tags"),
         "variants": variants_out,
         "images": images_out,
     }
 
-    cat_ids = normalize_categories_ids(src_product)
-    if cat_ids:
-        payload["categories"] = cat_ids
-
     return payload
 
 
-def set_jacula_published(product_id: int, published: bool):
+def update_product_published_only(jacula_product_id: int, published: bool):
+    payload = {"published": published}
     resp = request_with_retry(
         "PUT",
-        f"{API_BASE}/{JACULA_STORE_ID}/products/{product_id}",
+        f"{API_BASE}/{JACULA_STORE_ID}/products/{jacula_product_id}",
         headers=JACULA_HEADERS,
-        json={"published": published},
+        json=payload,
     )
     print(f"  → {resp.status_code} {resp.text[:200]}")
-    return resp
 
 
-def sync():
-    print("Descargando productos de Chesmin...")
+def sync_chesmin_to_jacula():
+    print("Descargando productos de Chesmin (origen)...")
     chesmin_products = get_all_products(CHESMIN_STORE_ID, CHESMIN_HEADERS)
-    print(f"  → {len(chesmin_products)} totales en Chesmin")
+    total_chesmin = len(chesmin_products)
+    visibles = [p for p in chesmin_products if p.get("published") is True]
+    print(f"  → {total_chesmin} productos totales en Chesmin")
+    print(f"  → {len(visibles)} productos visibles en Chesmin (a clonar/actualizar)")
 
-    visible_chesmin = [p for p in chesmin_products if p.get("published") is True]
-    hidden_chesmin = [p for p in chesmin_products if p.get("published") is False]
-    print(f"  → {len(visible_chesmin)} visibles (se crean/actualizan)")
-    print(f"  → {len(hidden_chesmin)} ocultos (solo se ocultan si ya existen en Jacula)")
-
-    print("Descargando productos de Jacula...")
+    print("Descargando productos de Jacula (destino)...")
     jacula_products = get_all_products(JACULA_STORE_ID, JACULA_HEADERS)
-    print(f"  → {len(jacula_products)} totales en Jacula")
+    print(f"  → {len(jacula_products)} productos encontrados en Jacula")
 
     jacula_by_key = {}
     for p in jacula_products:
@@ -217,31 +209,36 @@ def sync():
         if key:
             jacula_by_key[key] = p
 
-    # 1) Crear/actualizar solo VISIBLES
-    for src in visible_chesmin:
+    chesmin_by_key = {}
+    for p in chesmin_products:
+        key = build_product_key(p)
+        if key:
+            chesmin_by_key[key] = p
+
+    # 1) Crear/Actualizar SOLO visibles
+    for src in visibles:
         key = build_product_key(src)
         if not key:
             continue
 
         dst = jacula_by_key.get(key)
-
-        payload = build_payload(src)
-        payload["published"] = True
+        payload = build_jacula_payload_from_chesmin(src)
 
         if dst:
             if product_has_excluded_category(dst):
-                print(f"[SKIP] Capsula Jacula ✿  key={key}")
+                print(f"[SKIP] {EXCLUDED_CATEGORY_NAME} key={key}")
                 continue
 
-            pid = dst["id"]
-            print(f"[UPDATE] key={key} id={pid}")
+            product_id = dst["id"]
+            print(f"[UPDATE] key={key} id={product_id}")
             resp = request_with_retry(
                 "PUT",
-                f"{API_BASE}/{JACULA_STORE_ID}/products/{pid}",
+                f"{API_BASE}/{JACULA_STORE_ID}/products/{product_id}",
                 headers=JACULA_HEADERS,
                 json=payload,
             )
             print(f"  → {resp.status_code} {resp.text[:200]}")
+
         else:
             print(f"[CREATE] key={key}")
             resp = request_with_retry(
@@ -252,26 +249,22 @@ def sync():
             )
             print(f"  → {resp.status_code} {resp.text[:200]}")
 
-    # 2) Ocultar en Jacula lo que ocultás en Chesmin (solo si existe en Jacula)
-    for src in hidden_chesmin:
-        key = build_product_key(src)
-        if not key:
-            continue
-
-        dst = jacula_by_key.get(key)
-        if not dst:
-            continue
-
+    # 2) Ocultar en Jacula los que en Chesmin estén ocultos (solo si existen en Jacula)
+    print("Sincronizando ocultamientos (Chesmin → Jacula)...")
+    for key, dst in jacula_by_key.items():
         if product_has_excluded_category(dst):
             continue
 
-        pid = dst["id"]
-        if dst.get("published") is True:
-            print(f"[HIDE] key={key} id={pid}")
-            set_jacula_published(pid, False)
+        src = chesmin_by_key.get(key)
+        if not src:
+            continue
 
-    print("OK. Sincronización terminada.")
+        if src.get("published") is False and dst.get("published") is True:
+            print(f"[HIDE] key={key} id={dst['id']}")
+            update_product_published_only(dst["id"], False)
+
+    print("Sincronización terminada.")
 
 
 if __name__ == "__main__":
-    sync()
+    sync_chesmin_to_jacula()
